@@ -6,11 +6,20 @@ import cheerio from 'cheerio';
 const EMAIL = process.env.EMAIL
 const PASSWORD = process.env.PASSWORD
 const SCHEDULE_ID = process.env.SCHEDULE_ID
-const FACILITY_ID = process.env.FACILITY_ID
+// Parse comma-separated facility IDs into an array
+const FACILITY_IDS = process.env.FACILITY_ID.split(',').map(id => id.trim())
 const LOCALE = process.env.LOCALE
 const REFRESH_DELAY = Number(process.env.REFRESH_DELAY || 3)
 
 const BASE_URI = `https://ais.usvisa-info.com/${LOCALE}/niv`
+
+// Custom error class for session expiration
+class SessionExpiredError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SessionExpiredError";
+  }
+}
 
 async function main(currentBookedDate) {
   if (!currentBookedDate) {
@@ -19,33 +28,42 @@ async function main(currentBookedDate) {
   }
 
   log(`Initializing with current date ${currentBookedDate}`)
+  log(`Checking ${FACILITY_IDS.length} facilities: ${FACILITY_IDS.join(', ')}`)
 
-  try {
-    const sessionHeaders = await login()
+  let sessionHeaders = await login()
 
-    while(true) {
-      const date = await checkAvailableDate(sessionHeaders)
+  while(true) {
+    try {
+      const result = await checkAvailableDateAllFacilities(sessionHeaders)
 
-      if (!date) {
-        log("no dates available")
-      } else if (date > currentBookedDate) {
-        log(`nearest date is further than already booked (${currentBookedDate} vs ${date})`)
+      if (!result) {
+        log("no dates available at any facility")
+      } else if (result.date > currentBookedDate) {
+        log(`nearest date is further than already booked (${currentBookedDate} vs ${result.date} at facility ${result.facilityId})`)
       } else {
-        currentBookedDate = date
-        const time = await checkAvailableTime(sessionHeaders, date)
+        currentBookedDate = result.date
+        const time = await checkAvailableTime(sessionHeaders, result.date, result.facilityId)
 
-        book(sessionHeaders, date, time)
-          .then(d => log(`booked time at ${date} ${time}`))
+        book(sessionHeaders, result.date, time, result.facilityId)
+          .then(d => log(`booked time at ${result.date} ${time} at facility ${result.facilityId}`))
       }
 
       await sleep(REFRESH_DELAY)
+    } catch(err) {
+      if (err instanceof SessionExpiredError) {
+        log("Session expired. Logging in again...")
+        try {
+          sessionHeaders = await login()
+          log("Successfully logged in again")
+        } catch (loginError) {
+          console.error("Error during re-login:", loginError)
+          await sleep(REFRESH_DELAY * 2) // Wait a bit longer before retrying
+        }
+      } else {
+        console.error("Error during operation:", err)
+        await sleep(REFRESH_DELAY) // Standard delay before retry
+      }
     }
-
-  } catch(err) {
-    console.error(err)
-    log("Trying again")
-
-    main(currentBookedDate)
   }
 }
 
@@ -82,8 +100,79 @@ async function login() {
     ))
 }
 
-function checkAvailableDate(headers) {
-  return fetch(`${BASE_URI}/schedule/${SCHEDULE_ID}/appointment/days/${FACILITY_ID}.json?appointments[expedite]=false`, {
+// New function to check dates across all facilities
+async function checkAvailableDateAllFacilities(headers) {
+  let bestResult = null;
+  
+  // Calculate the minimum valid date (2 days from now)
+  const today = new Date();
+  const minValidDate = new Date();
+  minValidDate.setDate(today.getDate() + 2);
+  minValidDate.setHours(0, 0, 0, 0); // Start of day
+  
+  log(`Checking dates for ${FACILITY_IDS.length} facilities...`);
+  
+  let sessionExpired = false;
+  
+  // Check each facility and track the best result
+  for (const facilityId of FACILITY_IDS) {
+    try {
+      const dates = await checkAvailableDatesForFacility(headers, facilityId);
+      
+      if (!dates || dates.length === 0) {
+        log(`No dates available for facility ${facilityId}`);
+        continue;
+      }
+      
+      // Filter dates that are at least 2 days from now
+      const validDates = dates.filter(dateObj => {
+        const appointmentDate = new Date(dateObj.date);
+        return appointmentDate >= minValidDate;
+      });
+      
+      if (validDates.length === 0) {
+        log(`No valid dates (at least 2 days from now) for facility ${facilityId}`);
+        continue;
+      }
+      
+      // Sort dates and get the earliest valid one
+      validDates.sort((a, b) => new Date(a.date) - new Date(b.date));
+      const earliestDate = validDates[0].date;
+      
+      log(`Facility ${facilityId}: earliest date available is ${earliestDate}`);
+      
+      // If this is our first valid result or it's better than our previous best, update it
+      if (!bestResult || earliestDate < bestResult.date) {
+        bestResult = {
+          date: earliestDate,
+          facilityId: facilityId
+        };
+      }
+    } catch (error) {
+      log(`Error checking facility ${facilityId}: ${error.message}`);
+      
+      // If this is a session expiration error, flag it but continue checking other facilities
+      if (error instanceof SessionExpiredError) {
+        sessionExpired = true;
+      }
+    }
+  }
+  
+  // After checking all facilities, if we encountered a session expiration, throw it
+  if (sessionExpired) {
+    throw new SessionExpiredError("Your session expired, please sign in again to continue.");
+  }
+  
+  if (bestResult) {
+    log(`Best available date is ${bestResult.date} at facility ${bestResult.facilityId}`);
+  }
+  
+  return bestResult;
+}
+
+// Modified to check dates for a single facility
+function checkAvailableDatesForFacility(headers, facilityId) {
+  return fetch(`${BASE_URI}/schedule/${SCHEDULE_ID}/appointment/days/${facilityId}.json?appointments[expedite]=false`, {
     "headers": Object.assign({}, headers, {
       "Accept": "application/json",
       "X-Requested-With": "XMLHttpRequest",
@@ -91,13 +180,12 @@ function checkAvailableDate(headers) {
     "cache": "no-store"
   })
     .then(r => r.json())
-    .then(r => handleErrors(r))
-    .then(d => d.length > 0 ? d[0]['date'] : null)
-
+    .then(r => handleErrors(r));
 }
 
-function checkAvailableTime(headers, date) {
-  return fetch(`${BASE_URI}/schedule/${SCHEDULE_ID}/appointment/times/${FACILITY_ID}.json?date=${date}&appointments[expedite]=false`, {
+// Updated to include facilityId parameter
+function checkAvailableTime(headers, date, facilityId) {
+  return fetch(`${BASE_URI}/schedule/${SCHEDULE_ID}/appointment/times/${facilityId}.json?date=${date}&appointments[expedite]=false`, {
     "headers": Object.assign({}, headers, {
       "Accept": "application/json",
       "X-Requested-With": "XMLHttpRequest",
@@ -113,17 +201,29 @@ function handleErrors(response) {
   const errorMessage = response['error']
 
   if (errorMessage) {
+    // Check if the error is related to session expiration
+    if (errorMessage.includes("session expired") || errorMessage.includes("sign in again")) {
+      throw new SessionExpiredError(errorMessage);
+    }
     throw new Error(errorMessage);
   }
 
   return response
 }
 
-async function book(headers, date, time) {
+// Updated to include facilityId parameter
+async function book(headers, date, time, facilityId) {
   const url = `${BASE_URI}/schedule/${SCHEDULE_ID}/appointment`
 
   const newHeaders = await fetch(url, { "headers": headers })
     .then(response => extractHeaders(response))
+    .catch(error => {
+      // Check for session expiration in the response
+      if (error.message && (error.message.includes("session expired") || error.message.includes("sign in again"))) {
+        throw new SessionExpiredError(error.message);
+      }
+      throw error;
+    });
 
   return fetch(url, {
     "method": "POST",
@@ -136,7 +236,7 @@ async function book(headers, date, time) {
       'authenticity_token': newHeaders['X-CSRF-Token'],
       'confirmed_limit_message': '1',
       'use_consulate_appointment_capacity': 'true',
-      'appointments[consulate_appointment][facility_id]': FACILITY_ID,
+      'appointments[consulate_appointment][facility_id]': facilityId,
       'appointments[consulate_appointment][date]': date,
       'appointments[consulate_appointment][time]': time,
       'appointments[asc_appointment][facility_id]': '',
@@ -144,6 +244,17 @@ async function book(headers, date, time) {
       'appointments[asc_appointment][time]': ''
     }),
   })
+  .then(response => {
+    if (!response.ok) {
+      return response.text().then(text => {
+        if (text.includes("session expired") || text.includes("sign in again")) {
+          throw new SessionExpiredError("Session expired during booking");
+        }
+        throw new Error(`Booking failed: ${response.status} ${response.statusText}`);
+      });
+    }
+    return response;
+  });
 }
 
 async function extractHeaders(res) {
@@ -152,6 +263,11 @@ async function extractHeaders(res) {
   const html = await res.text()
   const $ = cheerio.load(html);
   const csrfToken = $('meta[name="csrf-token"]').attr('content')
+
+  // Check if the page indicates a session expiration
+  if (html.includes("session expired") || html.includes("sign in again") || !csrfToken) {
+    throw new SessionExpiredError("Session expired while extracting headers");
+  }
 
   return {
     "Cookie": cookies,
@@ -165,7 +281,16 @@ async function extractHeaders(res) {
 }
 
 function extractRelevantCookies(res) {
-  const parsedCookies = parseCookies(res.headers.get('set-cookie'))
+  const cookieHeader = res.headers.get('set-cookie')
+  if (!cookieHeader) {
+    throw new Error("No cookies in response");
+  }
+  
+  const parsedCookies = parseCookies(cookieHeader)
+  if (!parsedCookies['_yatri_session']) {
+    throw new SessionExpiredError("Session cookie not found");
+  }
+  
   return `_yatri_session=${parsedCookies['_yatri_session']}`
 }
 
